@@ -317,12 +317,12 @@ class ScalableTokenizedAttention(nn.Module):
       # Compute attention scores
       scores = torch.matmul(q, k.transpose(-1, -2)) / torch.sqrt(torch.tensor(self.head_dim, dtype=torch.float32, device=hidden_states.device))
       
-      # Debugging shapes
-      print(f"Scores shape: {scores.shape}")  # Shape: [batch_size, num_heads, seq_len, num_key_value_parameter_tokens]
+      # Debugging shapes uncomment the print statements below,there are 3 of them.
+      #print(f"Scores shape: {scores.shape}")  # Shape: [batch_size, num_heads, seq_len, num_key_value_parameter_tokens]
       
       # Adjust attention mask dimensions
       if attention_mask is not None:
-          print(f"Attention mask shape before unsqueeze: {attention_mask.shape}")
+          #print(f"Attention mask shape before unsqueeze: {attention_mask.shape}")
           
           attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # Align dimensions
   
@@ -335,7 +335,7 @@ class ScalableTokenizedAttention(nn.Module):
           elif attention_mask.shape[-1] > target_dim:
               attention_mask = attention_mask[..., :target_dim]    
 
-          print(f"Attention mask shape after padding: {attention_mask.shape}")
+          #print(f"Attention mask shape after padding: {attention_mask.shape}")
           scores = scores + attention_mask
 
       # Compute attention weights
