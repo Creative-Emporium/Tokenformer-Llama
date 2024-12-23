@@ -1,3 +1,4 @@
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,6 +16,7 @@ import os
 from transformers import AutoTokenizer
 import logging
 from pathlib import Path
+from itertools import cycle
 
 class TrainingConfig:
     def __init__(
@@ -547,24 +549,29 @@ def train_model(
     train_dataloader: DataLoader,
     config: TrainingConfig,
     eval_dataloader: Optional[DataLoader] = None,
-    tokenizer = None
+    tokenizer=None
 ) -> Dict[str, Union[float, list]]:
     """
     Train the ScalableTokenizedModel.
-    
+
     Args:
-        model: The model to train
-        train_dataloader: DataLoader for training data
-        config: TrainingConfig object containing training parameters
-        eval_dataloader: Optional DataLoader for evaluation
-        tokenizer: Optional tokenizer for generating text samples during evaluation
-    
+        model: The model to train.
+        train_dataloader: DataLoader for training data.
+        config: TrainingConfig object containing training parameters.
+        eval_dataloader: Optional DataLoader for evaluation.
+        tokenizer: Optional tokenizer for saving and generating text samples.
+
     Returns:
-        Dictionary containing training metrics
+        Dictionary containing training metrics.
     """
     device = next(model.parameters()).device
+    model.to(device)
     model.train()
-    
+
+    # Display total model parameters
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total Model Parameters: {total_params:,}")
+
     # Initialize optimizer
     optimizer = AdamW(
         model.parameters(),
@@ -572,138 +579,165 @@ def train_model(
         weight_decay=config.weight_decay,
         betas=(0.9, 0.95)
     )
-    
+
     # Initialize learning rate scheduler
     scheduler = CosineAnnealingLR(optimizer, T_max=config.max_steps)
-    
+
     # Initialize loss function
     criterion = CrossEntropyLoss()
-    
+
     # Initialize tracking variables
-    global_step = 0
-    total_loss = 0
-    best_eval_loss = float('inf')
     training_metrics = {
         'train_losses': [],
         'eval_losses': [],
         'learning_rates': []
     }
-    
+
+    # Save model config and tokenizer
+    os.makedirs(config.output_dir, exist_ok=True)
+    model.generate_config(config.output_dir)
+    if tokenizer:
+        tokenizer.save_pretrained(config.output_dir)
+
     # Initialize wandb if requested
     if config.use_wandb:
         wandb.init(project="scalable_tokenized_model", config=vars(config))
-    
-    # Create output directory
-    os.makedirs(config.output_dir, exist_ok=True)
-    
-    progress_bar = tqdm(total=config.max_steps, desc="Training")
-    
+
     try:
-        while global_step < config.max_steps:
+        # Infinite loop for dataloader using itertools.cycle
+        train_data_iter = cycle(train_dataloader)
+
+        for epoch in range(config.num_epochs):
+            epoch_start_time = time.time()
             epoch_loss = 0
-            for batch_idx, batch in enumerate(train_dataloader):
+            epoch_steps = 0
+
+            # Epoch progress bar
+            epoch_bar = tqdm(total=config.max_steps, desc=f"Epoch {epoch + 1}/{config.num_epochs}")
+
+            # Run for `max_steps` in each epoch
+            for step in range(config.max_steps):
+                batch = next(train_data_iter)  # Fetch the next batch
+
                 # Move batch to device
                 input_ids = batch['input_ids'].to(device)
                 attention_mask = batch.get('attention_mask', None)
                 if attention_mask is not None:
                     attention_mask = attention_mask.to(device)
-                
+
                 # Forward pass
                 outputs = model(input_ids, attention_mask=attention_mask)
-                
+
                 # Calculate loss
-                # Shift predictions and labels for causal LM
                 shift_logits = outputs[..., :-1, :].contiguous()
                 shift_labels = input_ids[..., 1:].contiguous()
                 loss = criterion(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-                
-                # Scale loss if using gradient accumulation
+
+                # Scale loss for gradient accumulation
                 loss = loss / config.gradient_accumulation_steps
-                
+
                 # Backward pass
                 loss.backward()
-                
-                if (batch_idx + 1) % config.gradient_accumulation_steps == 0:
+
+                if (step + 1) % config.gradient_accumulation_steps == 0:
                     # Clip gradients
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
-                    
-                    # Optimizer step
+
+                    # Optimizer and scheduler step
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
-                    
-                    # Update tracking variables
-                    global_step += 1
-                    total_loss += loss.item() * config.gradient_accumulation_steps
-                    epoch_loss += loss.item() * config.gradient_accumulation_steps
-                    
-                    # Log metrics
-                    if config.use_wandb:
-                        wandb.log({
-                            'train_loss': loss.item() * config.gradient_accumulation_steps,
-                            'learning_rate': scheduler.get_last_lr()[0],
-                            'global_step': global_step
-                        })
-                    
-                    training_metrics['train_losses'].append(loss.item() * config.gradient_accumulation_steps)
-                    training_metrics['learning_rates'].append(scheduler.get_last_lr()[0])
-                    
-                    # Update progress bar
-                    progress_bar.update(1)
-                    progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
-                    
-                    # Evaluation
-                    if global_step % config.eval_steps == 0 and eval_dataloader is not None:
-                        eval_loss = evaluate_model(model, eval_dataloader, criterion, device)
-                        training_metrics['eval_losses'].append(eval_loss)
-                        
-                        if eval_loss < best_eval_loss:
-                            best_eval_loss = eval_loss
-                            # Save best model
-                            torch.save({
-                                'step': global_step,
-                                'model_state_dict': model.state_dict(),
-                                'optimizer_state_dict': optimizer.state_dict(),
-                                'scheduler_state_dict': scheduler.state_dict(),
-                                'loss': best_eval_loss,
-                            }, os.path.join(config.output_dir, 'best_model.pth'))
-                        
-                        if config.use_wandb:
-                            wandb.log({'eval_loss': eval_loss})
-                        
-                        # Generate sample text if tokenizer is provided
-                        if tokenizer is not None:
-                            sample_text = generate_sample(model, tokenizer, device)
-                            if config.use_wandb:
-                                wandb.log({'sample_text': sample_text})
-                    
-                    # Save checkpoint
-                    if global_step % config.save_steps == 0:
-                        torch.save({
-                            'step': global_step,
-                            'model_state_dict': model.state_dict(),
-                            'optimizer_state_dict': optimizer.state_dict(),
-                            'scheduler_state_dict': scheduler.state_dict(),
-                            'loss': total_loss / global_step,
-                        }, os.path.join(config.output_dir, f'checkpoint_{global_step}.pth'))
-                
-                if global_step >= config.max_steps:
-                    break
-    
+
+                # Update tracking variables
+                epoch_loss += loss.item() * config.gradient_accumulation_steps
+                epoch_steps += 1
+
+                # Update progress bar
+                epoch_bar.update(1)
+                epoch_bar.set_postfix({
+                    "Batch Loss": f"{loss.item() * config.gradient_accumulation_steps:.4f}",
+                    "LR": f"{scheduler.get_last_lr()[0]:.6f}"
+                })
+
+                # Log metrics with wandb
+                if config.use_wandb:
+                    wandb.log({
+                        'train_loss': loss.item() * config.gradient_accumulation_steps,
+                        'learning_rate': scheduler.get_last_lr()[0],
+                        'global_step': epoch * config.max_steps + step + 1,
+                        'epoch': epoch + 1
+                    })
+
+            epoch_time = time.time() - epoch_start_time
+            throughput = config.max_steps / epoch_time  # Throughput is based on max_steps
+
+            # Calculate average loss for the epoch
+            avg_epoch_loss = epoch_loss / epoch_steps
+            training_metrics['train_losses'].append(avg_epoch_loss)
+
+            # Evaluate model at the end of the epoch
+            eval_loss = None
+            if eval_dataloader:
+                eval_loss = evaluate_model(model, eval_dataloader, criterion, device)
+                training_metrics['eval_losses'].append(eval_loss)
+
+            # Generate sample text after each epoch
+            sample_output_pokemon = None
+            sample_output_shakespeare = None
+            if tokenizer:
+                # Pokémon-style sample generation
+                pokemon_prompt = "Ash Ketchum stood at the edge of the forest, wondering"
+                sample_output_pokemon = generate_sample(
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    prompt=pokemon_prompt,
+                    max_length=100
+                )
+
+                # Shakespeare-style sample generation
+                shakespeare_prompt = "Shall I compare thee to a summer's day?"
+                sample_output_shakespeare = generate_sample(
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    prompt=shakespeare_prompt,
+                    max_length=100
+                )
+
+            # Log sample outputs with wandb
+            if config.use_wandb:
+                if sample_output_pokemon:
+                    wandb.log({'pokemon_sample_output': sample_output_pokemon})
+                if sample_output_shakespeare:
+                    wandb.log({'shakespeare_sample_output': sample_output_shakespeare})
+
+            # Display epoch summary
+            print(f"\nEpoch {epoch + 1}/{config.num_epochs} Summary:")
+            print(f"  Training Loss: {avg_epoch_loss:.4f}")
+            if eval_loss is not None:
+                print(f"  Validation Loss: {eval_loss:.4f}")
+            print(f"  Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
+            print(f"  Throughput: {throughput:.2f} samples/sec")
+            print(f"  Time Taken: {epoch_time:.2f} seconds")
+            if sample_output_pokemon:
+                print(f"  Pokémon Sample Output: {sample_output_pokemon}")
+            if sample_output_shakespeare:
+                print(f"  Shakespeare Sample Output: {sample_output_shakespeare}")
+            print("-" * 50)
+
+            epoch_bar.close()
+
+            # Save the model checkpoint after each epoch
+            torch.save(model.state_dict(), os.path.join(config.output_dir, f'model_epoch_{epoch + 1}.pth'))
+
     except KeyboardInterrupt:
         print("\nTraining interrupted by user. Saving checkpoint...")
-        torch.save({
-            'step': global_step,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'loss': total_loss / global_step,
-        }, os.path.join(config.output_dir, 'interrupted_checkpoint.pth'))
-    
-    progress_bar.close()
+        torch.save(model.state_dict(), os.path.join(config.output_dir, 'interrupted_checkpoint.pth'))
+
     if config.use_wandb:
         wandb.finish()
-    
+
     return training_metrics
 
 # Helper function for inference
@@ -809,7 +843,7 @@ if __name__ == '__main__':
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    output = inference(model, tokenizer, "Write a short story about a friendly robot.", 
+    output = inference(model, tokenizer, "Shall I compare thee to a summer's day? Thou art more lovely and more temperate.", 
                       max_length=200,
                       temperature=0.7,
                       top_k=50,
@@ -863,6 +897,7 @@ if __name__ == '__main__':
       max_steps=10000,
       eval_steps=1000,
       save_steps=5000,
+      num_epochs=5,
       use_wandb=False  # Set to True if you want to use Weights & Biases
     )
 
