@@ -1,21 +1,35 @@
-batch_size: 32
-d_model: 64
-data_path: /content/tinyshakespeare.txt
-dataset_config: wikitext-2-raw-v1
-dataset_name: wikitext
-dropout: 0.1
-expansion_factor: 4
-gqa_num_groups: 2
-gradient_accumulation_steps: 5
-init_model_size: 1
-learning_rate: 0.0001
-local_dataset: true
-max_seq_len: 128
-n_layers: 4
-num_epochs: 3
-num_params: 16.753152
-online_dataset: false
-save_path: trained_model
-scale_factor: 1
-scale_model: false
-weight_decay: 0.01
+# Model Parameters
+d_model: 64               # Embedding dimension
+n_layers: 4               # Number of TokenFormer blocks
+gqa_num_groups: 2         # Number of groups for GQA
+expansion_factor: 4       # Expansion factor for FFN
+dropout: 0.1              # Dropout probability
+max_seq_len: 128          # Maximum sequence length
+init_model_size: 1000000  # Initial target size for model params
+scale_model: false        # If to scale the model via initialization and scale_factor 
+scale_factor: 1           # Factor for scaling the model
+norm_activation_type: "l2_norm_gelu" # whether to use l2 norm and gelu after the linear layer. options: gelu, relu, swish, l2_norm_gelu
+init_method: "normal" # weight initialization method for all modules except the output projection. Options: normal, xavier_uniform
+output_layer_init_method: "wang_init" #output projection weight initialization. Options: normal, wang_init
+use_flash_attention: false # whether to use flash attention
+rotary_pct: 0.25 # rotary embeddings dimension as a percentage of d_model
+use_bias_in_attn_linear: false # whether to use biases in the linear projection layers
+
+# Training Parameters
+batch_size: 32            # Batch size
+learning_rate: 0.0001     # Learning rate
+weight_decay: 0.0001      # Weight decay
+num_epochs: 3             # Number of training epochs
+gradient_accumulation_steps: 5 # Gradient accumulation steps
+gradient_clipping: 1.0 # value to clip gradient norm at. If false then no clipping is applied
+warmup_steps: 100
+lr_scheduler: "linear" # linear or cosine scheduling options
+optimizer: "adamw" # optimizer choice between adam, adan and lion
+
+# Dataset Parameters
+local_dataset: true    # Flag if using local dataset
+data_path: "tinyshakespeare.txt" # Path to local dataset, will be used if local_dataset is true
+online_dataset: false # Flag if using online dataset
+dataset_name: "wikitext" # Huggingface dataset
+dataset_config: "wikitext-2-raw-v1" # Huggingface dataset config
+num_params: 0          # Used to store model params after training
