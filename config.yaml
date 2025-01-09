@@ -23,8 +23,9 @@ num_epochs: 3             # Number of training epochs
 gradient_accumulation_steps: 5 # Gradient accumulation steps
 gradient_clipping: 1.0 # value to clip gradient norm at. If false then no clipping is applied
 warmup_steps: 100
-lr_scheduler: "linear" # linear or cosine scheduling options
+lr_scheduler: "cosine" # linear or cosine scheduling options
 optimizer: "adamw" # optimizer choice between adam, adan and lion
+train_ratio: 0.9
 
 # Dataset Parameters
 local_dataset: true    # Flag if using local dataset
@@ -32,4 +33,3 @@ data_path: "tinyshakespeare.txt" # Path to local dataset, will be used if local_
 online_dataset: false # Flag if using online dataset
 dataset_name: "wikitext" # Huggingface dataset
 dataset_config: "wikitext-2-raw-v1" # Huggingface dataset config
-num_params: 0          # Used to store model params after training
