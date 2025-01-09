@@ -4,6 +4,7 @@ import json
 import yaml
 import torch
 import time
+import random
 import logging
 import argparse
 import numpy as np
@@ -400,15 +401,15 @@ class TrainingLogger:
         num_epochs = len(self.train_losses) // len(train_dataloader) # calculate epochs
 
         # Reshape loss and perplexity
-        reshaped_train_losses = [np.mean(self.train_losses[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]) for i in range(num_epochs)]
-        reshaped_train_perplexity = [np.mean(self.train_perplexity[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]) for i in range(num_epochs)]
-        
+        reshaped_train_losses = [np.mean([loss.cpu().item() for loss in self.train_losses[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]]) for i in range(num_epochs)]
+        reshaped_train_perplexity = [np.mean([math.exp(loss.cpu().item()) for loss in self.train_losses[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]]) for i in range(num_epochs)]
+    
         reshaped_val_losses = []
         reshaped_val_perplexity = []
 
         if self.val_losses:
-             reshaped_val_losses = [np.mean(self.val_losses[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]) for i in range(num_epochs)]
-             reshaped_val_perplexity = [np.mean(self.val_perplexity[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]) for i in range(num_epochs)]
+             reshaped_val_losses = [np.mean([loss.cpu().item() for loss in self.val_losses[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]]) for i in range(num_epochs)]
+             reshaped_val_perplexity = [np.mean([math.exp(loss.cpu().item()) for loss in self.val_losses[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]]) for i in range(num_epochs)]
 
         epochs = range(1, num_epochs + 1)
         fig, axs = plt.subplots(2, 1, figsize = (10,8))
@@ -434,7 +435,7 @@ class TrainingLogger:
         plt.tight_layout()
         plt.savefig('loss_and_perplexity_plot.png')
         plt.show()
-
+        
 class TextDataset(Dataset):
     def __init__(self, texts, tokenizer, max_seq_len):
         self.texts = texts
@@ -505,7 +506,6 @@ def scale_model_params(model, scale_factor):
                 new_weight = torch.randn(module.num_embeddings, new_embedding_size, device = module.weight.device, dtype = module.weight.dtype)
                 new_weight[:,:module.weight.shape[1]] = original_weight
                 module.weight = torch.nn.Parameter(new_weight)
-
 
     for name, module in model.named_modules():
       if isinstance(module, nn.Linear):
@@ -655,9 +655,12 @@ class ModelTrainer:
       return total_norm
 
     def _clip_gradients(self):
+      pass
+
+    '''def _clip_gradients(self):
         grad_clip = self.config.get('gradient_clipping', 1.0)
         if grad_clip:
-           clip_grad_norm_(self.accelerator.unwrap_model(self.model).parameters(), grad_clip)
+           clip_grad_norm_(self.accelerator.unwrap_model(self.model).parameters(), grad_clip)'''
 
     def _train_step(self, batch):
         input_ids = batch['input_ids']
@@ -681,7 +684,6 @@ class ModelTrainer:
        outputs = self.model(input_ids, mask=attention_mask)
        loss = self._compute_loss(outputs, input_ids)
        return loss.detach()# returns loss as a detached tensor
-
 
     def train(self, save_path="trained_model"):
         for epoch in range(self.config['num_epochs']):
@@ -709,7 +711,7 @@ class ModelTrainer:
                         val_progress_bar.set_postfix(val_loss=gathered_loss)
 
         self.training_logger.log_final_summary()
-        self.training_logger.plot_losses_and_perplexity(save_path="trained_model")        
+        self.training_logger.plot_losses_and_perplexity(self.train_dataloader)        
         self._save_model(save_path)
 
     def _save_model(self, save_path):
@@ -746,6 +748,14 @@ def main():
     # Load the configurations
     config = load_config(args.config_path)
 
+    seed_value = 42  # You can choose any integer
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
+    torch.cuda.manual_seed_all(seed_value) # if using GPU
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
     # Load dataset
     full_dataset = load_text_data(config)
     tokenizer = full_dataset.tokenizer
@@ -797,12 +807,18 @@ def main():
       trainer = ModelTrainer(model, train_dataset, val_dataset, config) # initializes training
       trainer.train() # train the model
 
+      # Save model after training
+      trainer._save_model("trained_model")
+
     print(f"Model initialized with {sum(p.numel() for p in model.parameters() if p.requires_grad):,} parameters.")
 
     # Update and save config to have updated model size
     initial_json_config['num_params'] = get_num_params(model)
     save_json_config(initial_json_config, os.path.join('trained_model',"config.json"))
     print(f"Updated config with current model size and saved at trained_model/config.json")
+    
+    #Plot after save
+    trainer.training_logger.plot_losses_and_perplexity(trainer.train_dataloader)
 
 if __name__ == '__main__':
     main()
