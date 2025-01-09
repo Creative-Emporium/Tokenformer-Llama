@@ -403,16 +403,16 @@ class TrainingLogger:
         num_epochs = len(self.train_losses) // len(train_dataloader) # calculate epochs
 
         # Reshape loss and perplexity
-        reshaped_train_losses = [np.mean(self.train_losses[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]) for i in range(num_epochs)]
-        reshaped_train_perplexity = [np.mean(self.train_perplexity[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]) for i in range(num_epochs)]
+        reshaped_train_losses = [np.mean([loss.cpu().numpy() for loss in self.train_losses[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]]) for i in range(num_epochs)]
+        reshaped_train_perplexity = [np.mean([perplexity.cpu().numpy() for perplexity in self.train_perplexity[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]]) for i in range(num_epochs)]
 
     
         reshaped_val_losses = []
         reshaped_val_perplexity = []
 
         if self.val_losses:
-             reshaped_val_losses = [np.mean(self.val_losses[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]) for i in range(num_epochs)]
-             reshaped_val_perplexity = [np.mean(self.val_perplexity[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]) for i in range(num_epochs)]
+             reshaped_val_losses = [np.mean([loss.cpu().numpy() for loss in self.val_losses[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]]) for i in range(num_epochs)]
+             reshaped_val_perplexity = [np.mean([perplexity.cpu().numpy() for perplexity in self.val_perplexity[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]]) for i in range(num_epochs)]
 
         epochs = range(1, num_epochs + 1)
         fig, axs = plt.subplots(2, 1, figsize = (10,8))
@@ -755,7 +755,7 @@ class ModelTrainer:
             print('-' * 100)
             print(f"Epoch {epoch+1} Average: Train: Average Loss = {avg_epoch_loss:.4f}, "
                  f"Average Gradient Norm = {avg_epoch_grad_norm:.4f}, "
-                 f"Average Validation Loss = {avg_val_loss:.4f}, "
+                 f"Validation Loss = {avg_val_loss:.4f}, "
                   f"Total Tokens Seen = {self.training_logger.total_tokens}")
             print('-' * 100)
 
