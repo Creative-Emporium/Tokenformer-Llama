@@ -28,8 +28,11 @@ optimizer: "adamw" # optimizer choice between adam, adan and lion
 train_ratio: 0.9
 
 # Dataset Parameters
-local_dataset: true    # Flag if using local dataset
+local_dataset: false    # Flag if using local dataset
 data_path: "tinyshakespeare.txt" # Path to local dataset, will be used if local_dataset is true
-online_dataset: false # Flag if using online dataset
+online_dataset: true # Flag if using online dataset
 dataset_name: "wikitext" # Huggingface dataset
 dataset_config: "wikitext-2-raw-v1" # Huggingface dataset config
+
+# Saving Parameters
+save_path: "trained_model"
