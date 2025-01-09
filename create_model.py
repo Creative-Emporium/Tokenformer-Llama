@@ -1,4 +1,5 @@
 import os
+import sys
 import math
 import json
 import yaml
@@ -10,6 +11,7 @@ import argparse
 import numpy as np
 from tqdm import tqdm
 import torch.nn as nn
+from itertools import cycle
 import torch.optim as optim
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
@@ -372,7 +374,7 @@ class TrainingLogger:
         self.train_perplexity = []
         self.val_perplexity = []
 
-    def log_step(self, loss: float, grad_norm: float, tokens: int, is_train_step: bool = True):
+    def log_step(self, loss: torch.Tensor, grad_norm: float, tokens: int, is_train_step: bool = True):
         if is_train_step:
             self.total_loss += loss
             self.total_grad_norm += grad_norm
@@ -380,13 +382,13 @@ class TrainingLogger:
             self.steps += 1
             self.train_losses.append(loss)
             self.train_perplexity.append(math.exp(loss))
-            logger.info(f"Train Step {self.steps}: Loss = {loss:.4f}, Gradient Norm = {grad_norm:.4f}, Tokens Seen = {self.total_tokens}")
+            #logger.info(f"Train Step {self.steps}: Training Loss = {loss:.4f}, Gradient Norm = {grad_norm:.4f}, Tokens Seen = {self.total_tokens}")
         else:
             self.total_val_loss += loss
             self.val_steps +=1
             self.val_losses.append(loss)
             self.val_perplexity.append(math.exp(loss))
-            logger.info(f"Validation Step {self.val_steps}: Validation Loss = {loss:.4f}")
+            #logger.info(f"Validation Step {self.val_steps}: Validation Loss = {loss:.4f}")
 
     def log_final_summary(self):
         avg_loss = self.total_loss / self.steps if self.steps else 0
@@ -401,15 +403,16 @@ class TrainingLogger:
         num_epochs = len(self.train_losses) // len(train_dataloader) # calculate epochs
 
         # Reshape loss and perplexity
-        reshaped_train_losses = [np.mean([loss.cpu().item() for loss in self.train_losses[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]]) for i in range(num_epochs)]
-        reshaped_train_perplexity = [np.mean([math.exp(loss.cpu().item()) for loss in self.train_losses[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]]) for i in range(num_epochs)]
+        reshaped_train_losses = [np.mean(self.train_losses[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]) for i in range(num_epochs)]
+        reshaped_train_perplexity = [np.mean(self.train_perplexity[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]) for i in range(num_epochs)]
+
     
         reshaped_val_losses = []
         reshaped_val_perplexity = []
 
         if self.val_losses:
-             reshaped_val_losses = [np.mean([loss.cpu().item() for loss in self.val_losses[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]]) for i in range(num_epochs)]
-             reshaped_val_perplexity = [np.mean([math.exp(loss.cpu().item()) for loss in self.val_losses[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]]) for i in range(num_epochs)]
+             reshaped_val_losses = [np.mean(self.val_losses[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]) for i in range(num_epochs)]
+             reshaped_val_perplexity = [np.mean(self.val_perplexity[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]) for i in range(num_epochs)]
 
         epochs = range(1, num_epochs + 1)
         fig, axs = plt.subplots(2, 1, figsize = (10,8))
@@ -657,11 +660,6 @@ class ModelTrainer:
     def _clip_gradients(self):
       pass
 
-    '''def _clip_gradients(self):
-        grad_clip = self.config.get('gradient_clipping', 1.0)
-        if grad_clip:
-           clip_grad_norm_(self.accelerator.unwrap_model(self.model).parameters(), grad_clip)'''
-
     def _train_step(self, batch):
         input_ids = batch['input_ids']
         attention_mask = batch['attention_mask']
@@ -684,31 +682,82 @@ class ModelTrainer:
        outputs = self.model(input_ids, mask=attention_mask)
        loss = self._compute_loss(outputs, input_ids)
        return loss.detach()# returns loss as a detached tensor
-
+    
+    def _get_progress_string(self, epoch, num_epochs, step, total_steps, loss, grad_norm, val_loss, tokens_seen):
+        return (
+            f"\rEpoch {epoch+1}/{num_epochs} Step {step+1}/{total_steps}: "
+            f"Loss = {loss:.4f}, Gradient Norm = {grad_norm:.4f}, "
+            f"Validation Loss = {val_loss:.4f}, Tokens Seen = {tokens_seen:.0f}"
+        )
+    
     def train(self, save_path="trained_model"):
-        for epoch in range(self.config['num_epochs']):
-            self.model.train()
-            progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {epoch+1}/{self.config['num_epochs']} (Training)")
+        print("Training initialized") # Sanity check print
+        epoch_losses = []
+        epoch_grad_norms = []
+        epoch_val_losses = []
 
-            for batch in progress_bar:
+        num_epochs = self.config['num_epochs']
+        for epoch in range(num_epochs):
+            self.model.train()
+            epoch_loss = 0
+            epoch_grad_norm = 0
+            epoch_steps = 0
+            total_steps_per_epoch = len(self.train_dataloader) # store total steps to use in our progress printer
+            for step, batch in enumerate(self.train_dataloader): # enumerate dataloader for access to step number
                 loss, grad_norm, num_tokens = self._train_step(batch)
-                # Gather metrics from all processes
                 gathered_loss, gathered_grad_norm, gathered_num_tokens = self.accelerator.gather_for_metrics((loss, grad_norm, num_tokens))
-                
-                # Since the gathered values are already floats, we don't need to call .item()
+            
                 self.training_logger.log_step(gathered_loss, gathered_grad_norm, gathered_num_tokens)
-                progress_bar.set_postfix(loss=gathered_loss)
+                epoch_loss += gathered_loss
+                epoch_grad_norm += gathered_grad_norm
+                epoch_steps += 1
+
+                # Calculate epoch averages
+                avg_epoch_loss = epoch_loss / epoch_steps
+                avg_epoch_grad_norm = epoch_grad_norm / epoch_steps
+
+                # Print progress using single line update
+                progress_str = self._get_progress_string(
+                     epoch,
+                     num_epochs,
+                     step,
+                     total_steps_per_epoch,
+                     gathered_loss,
+                     gathered_grad_norm,
+                     0,
+                     self.training_logger.total_tokens
+                 )
+
+                print(progress_str, end = '')
+           
+            print()
 
             if self.val_dataloader:
-                self.model.eval()
-                val_progress_bar = tqdm(self.val_dataloader, desc=f"Epoch {epoch+1}/{self.config['num_epochs']} (Validation)")
-                with torch.no_grad():
-                    for batch in val_progress_bar:
-                        loss = self._validation_step(batch)
-                        gathered_loss = self.accelerator.gather_for_metrics(loss)
-                        # Since the gathered loss is already a float, we don't need to call .item()
-                        self.training_logger.log_step(gathered_loss, grad_norm=0, tokens=0, is_train_step=False)
-                        val_progress_bar.set_postfix(val_loss=gathered_loss)
+                  self.model.eval()
+                  val_loss=0
+                  val_steps = 0
+                  with torch.no_grad():
+                      for val_batch in self.val_dataloader:
+                        loss = self._validation_step(val_batch)
+                        val_loss += self.accelerator.gather_for_metrics(loss)
+                        val_steps += 1
+                  avg_val_loss = val_loss / val_steps
+                  self.training_logger.log_step(avg_val_loss, 0, 0, is_train_step = False)
+            else:
+                  avg_val_loss = 0 # or some placeholder value
+
+            epoch_losses.append(avg_epoch_loss)
+            epoch_grad_norms.append(avg_epoch_grad_norm)
+            epoch_val_losses.append(avg_val_loss)
+          
+        
+            # Print epoch summary
+            print('-' * 100)
+            print(f"Epoch {epoch+1} Average: Train: Average Loss = {avg_epoch_loss:.4f}, "
+                 f"Average Gradient Norm = {avg_epoch_grad_norm:.4f}, "
+                 f"Validation Loss = {avg_val_loss:.4f}, "
+                  f"Total Tokens Seen = {self.training_logger.total_tokens}")
+            print('-' * 100)
 
         self.training_logger.log_final_summary()
         self.training_logger.plot_losses_and_perplexity(self.train_dataloader)        
@@ -805,6 +854,7 @@ def main():
         print(f"Initial Model size: {get_num_params(model)} million params")
 
       trainer = ModelTrainer(model, train_dataset, val_dataset, config) # initializes training
+      trainer.tokenizer = tokenizer # set tokenizer on the trainer class      
       trainer.train() # train the model
 
       # Save model after training
