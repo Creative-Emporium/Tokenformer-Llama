@@ -376,18 +376,18 @@ class TrainingLogger:
 
     def log_step(self, loss: torch.Tensor, grad_norm: float, tokens: int, is_train_step: bool = True):
         if is_train_step:
-            self.total_loss += loss
+            self.total_loss += loss.item()  # Store loss as a float in the total for summary
             self.total_grad_norm += grad_norm
             self.total_tokens += tokens
             self.steps += 1
-            self.train_losses.append(loss)
-            self.train_perplexity.append(math.exp(loss))
+            self.train_losses.append(loss.detach().cpu().numpy()) # Store the detached Tensor!
+            self.train_perplexity.append(torch.exp(loss).detach().cpu().numpy()) # Store the detached perplexity Tensor!
             #logger.info(f"Train Step {self.steps}: Training Loss = {loss:.4f}, Gradient Norm = {grad_norm:.4f}, Tokens Seen = {self.total_tokens}")
         else:
-            self.total_val_loss += loss
+            self.total_val_loss += loss.item()  # Store loss as a float in the total for summary
             self.val_steps +=1
-            self.val_losses.append(loss)
-            self.val_perplexity.append(math.exp(loss))
+            self.val_losses.append(loss.detach().cpu().numpy()) # Store the detached Tensor!
+            self.val_perplexity.append(torch.exp(loss).detach().cpu().numpy()) # Store the detached perplexity Tensor!
             #logger.info(f"Validation Step {self.val_steps}: Validation Loss = {loss:.4f}")
 
     def log_final_summary(self):
@@ -403,23 +403,38 @@ class TrainingLogger:
         num_epochs = len(self.train_losses) // len(train_dataloader) # calculate epochs
 
         # Reshape loss and perplexity
-        reshaped_train_losses = [np.mean([loss.cpu().numpy() for loss in self.train_losses[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]]) for i in range(num_epochs)]
-        reshaped_train_perplexity = [np.mean([perplexity.cpu().numpy() for perplexity in self.train_perplexity[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]]) for i in range(num_epochs)]
-
+        reshaped_train_losses = []
+        reshaped_train_perplexity = []
+        for i in range(num_epochs):
+            start_index = i * len(train_dataloader)
+            end_index = (i+1) * len(train_dataloader)
+            epoch_losses = self.train_losses[start_index:end_index]
+            epoch_perplexities = self.train_perplexity[start_index:end_index]
+            if epoch_losses:
+                reshaped_train_losses.append(np.mean(epoch_losses))
+            if epoch_perplexities:
+                reshaped_train_perplexity.append(np.mean(epoch_perplexities))
     
         reshaped_val_losses = []
         reshaped_val_perplexity = []
 
         if self.val_losses:
-             reshaped_val_losses = [np.mean([loss.cpu().numpy() for loss in self.val_losses[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]]) for i in range(num_epochs)]
-             reshaped_val_perplexity = [np.mean([perplexity.cpu().numpy() for perplexity in self.val_perplexity[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]]) for i in range(num_epochs)]
+          for i in range(num_epochs):
+            start_index = i * len(train_dataloader)
+            end_index = (i+1) * len(train_dataloader)
+            epoch_losses = self.val_losses[start_index:end_index]
+            epoch_perplexities = self.val_perplexity[start_index:end_index]
+            if epoch_losses:
+                reshaped_val_losses.append(np.mean(epoch_losses))
+            if epoch_perplexities:
+                reshaped_val_perplexity.append(np.mean(epoch_perplexities))
 
         epochs = range(1, num_epochs + 1)
         fig, axs = plt.subplots(2, 1, figsize = (10,8))
 
         axs[0].plot(epochs, reshaped_train_losses, label = "Training Loss")
         if reshaped_val_losses:
-            axs[0].plot(epochs, reshaped_val_losses, label = "Validation Loss")
+            axs[0].plot(epochs[:len(reshaped_val_losses)], reshaped_val_losses, label = "Validation Loss") # ensure lengths match
         axs[0].set_xlabel("Epochs")
         axs[0].set_ylabel("Loss")
         axs[0].set_title("Training and Validation Loss")
@@ -428,7 +443,7 @@ class TrainingLogger:
 
         axs[1].plot(epochs, reshaped_train_perplexity, label = "Training Perplexity")
         if reshaped_val_perplexity:
-          axs[1].plot(epochs, reshaped_val_perplexity, label = "Validation Perplexity")
+          axs[1].plot(epochs[:len(reshaped_val_perplexity)], reshaped_val_perplexity, label = "Validation Perplexity") # ensure lengths match
         axs[1].set_xlabel("Epochs")
         axs[1].set_ylabel("Perplexity")
         axs[1].set_title("Training and Validation Perplexity")
@@ -674,7 +689,7 @@ class ModelTrainer:
         self.optimizer.zero_grad()
         num_tokens = torch.numel(input_ids)
         # Convert tensors to floats before returning
-        return loss.detach().item(), grad_norm, float(num_tokens)
+        return loss.detach(), grad_norm, float(num_tokens)
 
     def _validation_step(self, batch):
        input_ids = batch['input_ids']
@@ -705,9 +720,11 @@ class ModelTrainer:
             total_steps_per_epoch = len(self.train_dataloader) # store total steps to use in our progress printer
             for step, batch in enumerate(self.train_dataloader): # enumerate dataloader for access to step number
                 loss, grad_norm, num_tokens = self._train_step(batch)
-                gathered_loss, gathered_grad_norm, gathered_num_tokens = self.accelerator.gather_for_metrics((loss, grad_norm, num_tokens))
-            
-                self.training_logger.log_step(gathered_loss, gathered_grad_norm, gathered_num_tokens)
+                gathered_loss, gathered_grad_norm, gathered_num_tokens = self.accelerator.gather_for_metrics((loss, torch.tensor(grad_norm), torch.tensor(num_tokens)))
+                #gathered_loss, gathered_grad_norm, gathered_num_tokens = self.accelerator.gather_for_metrics((loss, grad_norm, num_tokens))
+                
+                self.training_logger.log_step(gathered_loss, gathered_grad_norm.item(), gathered_num_tokens.item()) # unpack tensors to floatsself.training_logger.log_step(gathered_loss, gathered_grad_norm.item(), gathered_num_tokens.item()) # unpack tensors to floats
+                #self.training_logger.log_step(gathered_loss, gathered_grad_norm, gathered_num_tokens)
                 epoch_loss += gathered_loss
                 epoch_grad_norm += gathered_grad_norm
                 epoch_steps += 1
