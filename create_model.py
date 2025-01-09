@@ -396,31 +396,44 @@ class TrainingLogger:
                     f"Average Gradient Norm = {avg_grad_norm:.4f}, "
                     f"Total Tokens Seen = {self.total_tokens}")
 
-    def plot_losses_and_perplexity(self):
-      epochs = range(1, len(self.train_losses) // len(self.train_losses)+1)
-      fig, axs = plt.subplots(2, 1, figsize = (10,8))
+    def plot_losses_and_perplexity(self, train_dataloader):
+        num_epochs = len(self.train_losses) // len(train_dataloader) # calculate epochs
 
-      axs[0].plot(epochs, self.train_losses, label = "Training Loss")
-      if self.val_losses:
-        axs[0].plot(epochs, self.val_losses, label = "Validation Loss")
-      axs[0].set_xlabel("Epochs")
-      axs[0].set_ylabel("Loss")
-      axs[0].set_title("Training and Validation Loss")
-      axs[0].legend()
-      axs[0].grid(True)
+        # Reshape loss and perplexity
+        reshaped_train_losses = [np.mean(self.train_losses[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]) for i in range(num_epochs)]
+        reshaped_train_perplexity = [np.mean(self.train_perplexity[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]) for i in range(num_epochs)]
+        
+        reshaped_val_losses = []
+        reshaped_val_perplexity = []
 
-      axs[1].plot(epochs, self.train_perplexity, label = "Training Perplexity")
-      if self.val_perplexity:
-          axs[1].plot(epochs, self.val_perplexity, label = "Validation Perplexity")
-      axs[1].set_xlabel("Epochs")
-      axs[1].set_ylabel("Perplexity")
-      axs[1].set_title("Training and Validation Perplexity")
-      axs[1].legend()
-      axs[1].grid(True)
+        if self.val_losses:
+             reshaped_val_losses = [np.mean(self.val_losses[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]) for i in range(num_epochs)]
+             reshaped_val_perplexity = [np.mean(self.val_perplexity[i * len(train_dataloader) : (i + 1) * len(train_dataloader)]) for i in range(num_epochs)]
 
-      plt.tight_layout()
-      plt.savefig('loss_and_perplexity_plot.png')
-      plt.show()
+        epochs = range(1, num_epochs + 1)
+        fig, axs = plt.subplots(2, 1, figsize = (10,8))
+
+        axs[0].plot(epochs, reshaped_train_losses, label = "Training Loss")
+        if reshaped_val_losses:
+            axs[0].plot(epochs, reshaped_val_losses, label = "Validation Loss")
+        axs[0].set_xlabel("Epochs")
+        axs[0].set_ylabel("Loss")
+        axs[0].set_title("Training and Validation Loss")
+        axs[0].legend()
+        axs[0].grid(True)
+
+        axs[1].plot(epochs, reshaped_train_perplexity, label = "Training Perplexity")
+        if reshaped_val_perplexity:
+          axs[1].plot(epochs, reshaped_val_perplexity, label = "Validation Perplexity")
+        axs[1].set_xlabel("Epochs")
+        axs[1].set_ylabel("Perplexity")
+        axs[1].set_title("Training and Validation Perplexity")
+        axs[1].legend()
+        axs[1].grid(True)
+
+        plt.tight_layout()
+        plt.savefig('loss_and_perplexity_plot.png')
+        plt.show()
 
 class TextDataset(Dataset):
     def __init__(self, texts, tokenizer, max_seq_len):
@@ -696,7 +709,7 @@ class ModelTrainer:
                         val_progress_bar.set_postfix(val_loss=gathered_loss)
 
         self.training_logger.log_final_summary()
-        self.training_logger.plot_losses_and_perplexity()        
+        self.training_logger.plot_losses_and_perplexity(save_path="trained_model")        
         self._save_model(save_path)
 
     def _save_model(self, save_path):
