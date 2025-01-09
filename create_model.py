@@ -755,7 +755,7 @@ class ModelTrainer:
             print('-' * 100)
             print(f"Epoch {epoch+1} Average: Train: Average Loss = {avg_epoch_loss:.4f}, "
                  f"Average Gradient Norm = {avg_epoch_grad_norm:.4f}, "
-                 f"Validation Loss = {avg_val_loss:.4f}, "
+                 f"Average Validation Loss = {avg_val_loss:.4f}, "
                   f"Total Tokens Seen = {self.training_logger.total_tokens}")
             print('-' * 100)
 
