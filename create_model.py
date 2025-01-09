@@ -25,24 +25,54 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 def apply_rotary_emb(query, key, position_ids, rotary_dim):
-    cos_cached = torch.cos(position_ids * (10000.0**(-torch.arange(0, rotary_dim, 2, dtype = torch.float32, device = query.device) / rotary_dim))).unsqueeze(2)
-    sin_cached = torch.sin(position_ids * (10000.0**(-torch.arange(0, rotary_dim, 2, dtype = torch.float32, device = query.device) / rotary_dim))).unsqueeze(2)
+    """
+    Apply rotary positional embeddings to the query and key tensors.
 
-    query_rot = query[..., :rotary_dim]
-    key_rot = key[..., :rotary_dim]
-    query_pass = query[..., rotary_dim:]
-    key_pass = key[..., rotary_dim:]
+    Args:
+        query (torch.Tensor): Query tensor of shape (batch_size, seq_len, d_model).
+        key (torch.Tensor): Key tensor of shape (batch_size, num_slots, d_model).
+        position_ids (torch.Tensor): Position IDs of shape (seq_len,).
+        rotary_dim (int): Dimension of rotary embeddings to apply.
 
-    query_rot_cos = query_rot * cos_cached
-    query_rot_sin = rotate_half(query_rot) * sin_cached
-    query_rot = query_rot_cos + query_rot_sin
+    Returns:
+        torch.Tensor, torch.Tensor: Transformed query and key tensors.
+    """
+    batch_size, seq_len, d_model = query.shape
+    batch_size_key, num_slots, d_model_key = key.shape
+    assert d_model == d_model_key, f"key and query d_model should match"
+    assert position_ids.shape == (seq_len,), f"Position IDs must have shape ({seq_len},), got {position_ids.shape}."
+    assert rotary_dim <= d_model, f"Rotary dimension {rotary_dim} cannot exceed model dimension {d_model}."
+    #print(f"apply_rotary_emb: query {query.shape}, key {key.shape}, position_ids {position_ids.shape}, rotary_dim {rotary_dim}")
 
-    key_rot_cos = key_rot * cos_cached
-    key_rot_sin = rotate_half(key_rot) * sin_cached
-    key_rot = key_rot_cos + key_rot_sin
-    
-    query = torch.cat([query_rot, query_pass], dim = -1)
-    key = torch.cat([key_rot, key_pass], dim = -1)
+    # Calculate rotary positional embeddings
+    freq = torch.arange(0, rotary_dim, 2, device=query.device, dtype=query.dtype)
+    inv_freq = 1.0 / (10000.0 ** (freq / rotary_dim))
+    position_encodings = torch.einsum('i,j->ij', position_ids, inv_freq)  # (seq_len, rotary_dim//2)
+    cos_cached = torch.cos(position_encodings)  # (seq_len, rotary_dim//2)
+    sin_cached = torch.sin(position_encodings)  # (seq_len, rotary_dim//2)
+
+    # Split query and key into rotary and non-rotary components
+    query_rot = query[..., :rotary_dim]  # (batch_size, seq_len, rotary_dim)
+    key_rot = key[..., :rotary_dim]    # (batch_size, num_slots, rotary_dim)
+    query_pass = query[..., rotary_dim:] # (batch_size, seq_len, d_model-rotary_dim)
+    key_pass = key[..., rotary_dim:] # (batch_size, num_slots, d_model-rotary_dim)
+
+    # Apply rotary transformation
+    def rotate_half(x):
+      x1, x2 = x[..., :x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
+      return torch.cat((-x2, x1), dim=-1)
+
+    # Reshape cos and sin cached and repeat along the last dimension to match the query_rot dimension
+    cos_cached_repeated = cos_cached.unsqueeze(0).repeat(batch_size, 1, 2) # Shape: (batch_size, seq_len, rotary_dim)
+    sin_cached_repeated = sin_cached.unsqueeze(0).repeat(batch_size, 1, 2) # Shape: (batch_size, seq_len, rotary_dim)
+    query_rot_transformed = query_rot * cos_cached_repeated + rotate_half(query_rot) * sin_cached_repeated # Shape (batch_size, seq_len, rotary_dim)
+
+    # Key rotary position embeddings do not need to be computed as they are not dependant on sequence length and positional ids
+    key_rot_transformed = key_rot
+
+    # Concatenate rotary and non-rotary components
+    query = torch.cat([query_rot_transformed, query_pass], dim=-1) # Shape: (batch_size, seq_len, d_model)
+    key = torch.cat([key_rot_transformed, key_pass], dim=-1) # Shape: (batch_size, num_slots, d_model)
 
     return query, key
 
@@ -68,29 +98,73 @@ class GroupedQueryAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, query, key, value, mask=None, position_ids=None):
-        batch_size, seq_len, _ = query.shape
-        query = self.query_proj(query)
-        key = self.key_proj(key)
-        value = self.value_proj(value)
+        """
+        Forward pass for Grouped Query Attention (GQA).
 
-        if self.rotary_dim > 0:
-          query, key = apply_rotary_emb(query, key, position_ids, self.rotary_dim)
+        Args:
+            query (torch.Tensor): Query tensor of shape (batch_size, seq_len, d_model).
+            key (torch.Tensor): Key tensor of shape (batch_size, num_slots, d_model).
+            value (torch.Tensor): Value tensor of shape (batch_size, num_slots, d_model).
+            mask (torch.Tensor, optional): Attention mask of shape (batch_size, seq_len). Defaults to None.
+            position_ids (torch.Tensor, optional): Position IDs of shape (batch_size, seq_len). Defaults to None.
 
-        query = query.view(batch_size, seq_len, self.num_groups, self.d_head).transpose(1, 2)
-        key = key.view(batch_size, seq_len, self.num_groups, self.d_head).transpose(1, 2)
-        value = value.view(batch_size, seq_len, self.num_groups, self.d_head).transpose(1, 2)
+        Returns:
+            torch.Tensor: Output tensor after attention.
+        """
+        batch_size, seq_len, d_model = query.shape
+        num_slots = key.shape[1]  # Get the number of slots from key shape
 
-        attn_scores = torch.matmul(query, key.transpose(-2, -1)) / (self.d_head**0.5)
+        # Project query, key, and value tensors
+        query = self.query_proj(query)  # Shape: (batch_size, seq_len, d_model)
+        #print(f"GQA: query_proj shape = {query.shape}")
+        key = self.key_proj(key)        # Shape: (batch_size, num_slots, d_model)
+        #print(f"GQA: key_proj shape = {key.shape}")
+        value = self.value_proj(value)  # Shape: (batch_size, num_slots, d_model)
+        #print(f"GQA: value_proj shape = {value.shape}")
 
-        if mask is not None:
-            mask = mask.unsqueeze(1).unsqueeze(1)
-            attn_scores = attn_scores.masked_fill(mask == 0, float('-inf'))
+        # Apply rotary embeddings to the first `rotary_dim` dimensions
+        if self.rotary_dim > 0 and position_ids is not None:
+            query, key = apply_rotary_emb(query, key, position_ids, self.rotary_dim)
         
-        attn_weights = F.softmax(attn_scores, dim=-1)
+        #print(f"GQA: after rotary query shape = {query.shape}")
+        #print(f"GQA: after rotary key shape = {key.shape}")
+
+        # Reshape query, key, and value for grouped query attention
+        query = query.view(batch_size, seq_len, self.num_groups, self.d_head).transpose(1, 2)  # Shape: (batch_size, num_groups, seq_len, d_head)
+        #print(f"GQA: reshaped query shape = {query.shape}")
+        key = key.view(batch_size, num_slots, self.num_groups, self.d_head).transpose(1, 2)  # Shape: (batch_size, num_groups, num_slots, d_head)
+        #print(f"GQA: reshaped key shape = {key.shape}")
+        value = value.view(batch_size, num_slots, self.num_groups, self.d_head).transpose(1, 2) # Shape: (batch_size, num_groups, num_slots, d_head)
+        #print(f"GQA: reshaped value shape = {value.shape}")
+        
+        # Compute scaled dot-product attention
+        attn_scores = torch.matmul(query, key.transpose(-2, -1)) / (self.d_head ** 0.5)  # Shape: (batch_size, num_groups, seq_len, num_slots)
+        #print(f"GQA: attn_scores shape = {attn_scores.shape}")
+
+        # Apply mask (if provided)
+        if mask is not None:
+            mask = mask.unsqueeze(1).unsqueeze(1)  # Shape: (batch_size, 1, 1, seq_len)
+            mask_seq_len = mask.shape[-1] # Gets the sequence length from mask shape
+            mask = F.pad(mask, (0, num_slots-mask_seq_len), value = 1) # pads mask along last dimension
+            attn_scores = attn_scores.masked_fill(mask == 0, float('-inf'))
+
+        # Compute attention weights and apply dropout
+        attn_weights = F.softmax(attn_scores, dim=-1)  # Shape: (batch_size, num_groups, seq_len, num_slots)
+        #print(f"GQA: attn_weights shape = {attn_weights.shape}")
         attn_weights = self.dropout(attn_weights)
-        attn_output = torch.matmul(attn_weights, value)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
-        attn_output = self.out_proj(attn_output)
+
+        # Compute attention output
+        attn_output = torch.matmul(attn_weights, value)  # Shape: (batch_size, num_groups, seq_len, d_head)
+        #print(f"GQA: attn_output before view shape = {attn_output.shape}")
+        
+        # Transpose and view
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)  # Shape: (batch_size, seq_len, d_model)
+        #print(f"GQA: attn_output after view shape = {attn_output.shape}")
+
+        # Project output back to model dimension
+        attn_output = self.out_proj(attn_output)  # Shape: (batch_size, seq_len, d_model)
+        #print(f"GQA: attn_output after out_proj shape = {attn_output.shape}")
+
         return attn_output
 
 class FeedForwardNetwork(nn.Module):
@@ -164,13 +238,24 @@ class TokenFormerBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.qkv_slots = nn.Parameter(torch.randn(3, num_slots, d_model))
 
-    def forward(self, x, mask=None, position_ids = None):
-        qkv_params = self.qkv_slots # qkv_slots are the main parameters
-        qkv_params = self.parameter_attention(qkv_params)
-        
-        query, key, value = qkv_params[0].unsqueeze(0), qkv_params[1].unsqueeze(0), qkv_params[2].unsqueeze(0)
+    def forward(self, x, mask=None, position_ids=None):
+        batch_size, seq_len, d_model = x.shape
 
-        attn_output = self.attention(x, key.expand(x.shape[0], -1, -1), value.expand(x.shape[0], -1, -1), mask, position_ids)
+        # Parameter attention applies transformations to qkv_slots
+        qkv_params = self.parameter_attention(self.qkv_slots)  # Shape: (3, num_slots, d_model)
+
+        # Prepare query, key, and value tensors
+        query = x  # (batch_size, seq_len, d_model)
+        key = qkv_params[1].unsqueeze(0).expand(batch_size, -1, -1)  # (batch_size, num_slots, d_model)
+        value = qkv_params[2].unsqueeze(0).expand(batch_size, -1, -1)  # (batch_size, num_slots, d_model)
+        positions = torch.arange(0, seq_len, dtype=torch.long, device=x.device)
+        
+        #print(f"TokenFormerBlock: query {query.shape}, key {key.shape}, value {value.shape}")
+
+        # Attention mechanism with combined sequences
+        attn_output = self.attention(query, key, value, mask, positions)
+
+        # Apply normalization and feedforward
         x = self.layer_norm1(x + self.dropout(attn_output))
         ffn_output = self.ffn(x)
         x = self.layer_norm2(x + self.dropout(ffn_output))
@@ -180,7 +265,7 @@ class TokenFormer(nn.Module):
     """
     Complete TokenFormer model with embedding layer and multiple TokenFormer Blocks
     """
-    def __init__(self, vocab_size, d_model, n_layers, num_groups, expansion_factor, dropout, max_seq_len, num_attention_heads, qkv_slot_num, proj_slot_num, activation_fn, use_bias_in_attn_linear, rotary_pct, init_method, output_layer_init_method, norm_activation_type):
+    def __init__(self, vocab_size, d_model, n_layers, num_groups, expansion_factor, dropout, max_seq_len, num_attention_heads, qkv_slot_num, proj_slot_num, activation_fn, use_bias_in_attn_linear, rotary_pct, init_method, output_layer_init_method, norm_activation_type, initializer_range):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.position_embedding = nn.Embedding(max_seq_len, d_model)
@@ -195,6 +280,8 @@ class TokenFormer(nn.Module):
         self.norm_activation_type = norm_activation_type
         self.init_method = init_method
         self.output_layer_init_method = output_layer_init_method
+        self.initializer_range = initializer_range
+        self.d_model = d_model
         self.apply(self._init_weights)
         self.apply(self._init_output_layer)
 
@@ -670,7 +757,13 @@ def main():
         num_attention_heads=config['gqa_num_groups'],
         qkv_slot_num=config['d_model'],
         proj_slot_num=config['d_model'],
-        activation_fn = config.get('activation_fn', 'relu')
+        activation_fn = config.get('activation_fn', 'relu'),
+        use_bias_in_attn_linear = config.get('use_bias_in_attn_linear'),
+        rotary_pct = config.get('rotary_pct'),
+        init_method = config.get('init_method'),
+        output_layer_init_method = config.get('output_layer_init_method'),
+        norm_activation_type = config.get('norm_activation_type'),
+        initializer_range = config.get('initializer_range', 0.02),   
     )
     
     # Load Model params
@@ -690,6 +783,8 @@ def main():
 
       trainer = ModelTrainer(model, train_dataset, val_dataset, config) # initializes training
       trainer.train() # train the model
+
+    print(f"Model initialized with {sum(p.numel() for p in model.parameters() if p.requires_grad):,} parameters.")
 
     # Update and save config to have updated model size
     initial_json_config['num_params'] = get_num_params(model)
